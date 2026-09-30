@@ -895,3 +895,60 @@ Esta rodada incluiu pesquisa web pública, só por nome: nenhum código foi envi
 
 - **Hooks:** payloads Claude sintéticos (PostToolUse, UserPromptSubmit, Stop) foram alimentados via shell em `node dist/cli/index.js hook --agent claude`. Os payloads estão descritos na seção 4.
 - **HTTP e dashboard:** sondados com `curl` em `serve-http --port 39211` e `dashboard --port 39210`, em 127.0.0.1, com os headers `Host: evil.example` e `Origin: https://evil.example`.
+
+---
+
+## Adendo 1: opção C+ (Memorix stock com perímetro) — revisão da recomendação
+
+**Pergunta que motivou o adendo:** conseguimos deixar o Memorix seguro com menos trabalho e menos manutenção do que construindo a nossa solução?
+
+A seção 25 comparou "do zero" com "fork completo", mas deixou de fora uma terceira via: **não alterar o código do Memorix e controlar o ambiente em volta dele**. Este adendo corrige essa lacuna.
+
+### Teste t12 (`synthetic-tests/t12-perimeter.mjs`) [TESTE]
+
+Condições do teste:
+
+- `MEMORIX_DATA_DIR` separado por projeto;
+- perfil `micro`;
+- `MEMORIX_LLM_BASE_URL` fixado no ambiente do servidor, apontando para um endereço morto;
+- `MEMORIX_AUTO_UPDATE=off`.
+
+| Ataque (da seção 10/14) | Sem perímetro | Com perímetro |
+|---|---|---|
+| Busca `scope:"global"` a partir de B | leu A | **nada encontrado** |
+| `memorix_detail` com `obs:1@projA` | leu A | **nada encontrado** |
+| `session_start({projectRoot: A})` e depois busca | leu A | **nada encontrado** |
+| `session_start({projectRoot: A})` e depois store | gravou em A | gravou **no banco de B** (A não vê) |
+| `memorix_transfer import` | gravou em A com proveniência forjada | **a tool não existe** no perfil micro |
+| `.env` malicioso com URL e chave próprias do atacante | vazou chave e conteúdo | **0 requisições** ao endpoint (variáveis de ambiente do sistema têm prioridade sobre o `.env`: `dotenv-loader.ts:63-90`; `resolved-config.ts:111-116`) |
+
+### O que o perímetro exige (código nosso, fora do Memorix)
+
+| Peça | Tamanho estimado [INF] | Depende de detalhes internos do Memorix? |
+|---|---|---|
+| Launcher do MCP: calcula a raiz git, define `MEMORIX_DATA_DIR=~/.cm/<id-do-projeto>`, perfil `micro`, remove `OPENAI_API_KEY`/`ANTHROPIC_API_KEY`, fixa `MEMORIX_LLM_BASE_URL`, `MEMORIX_AUTO_UPDATE=off`; config de `autoCleanup:false` | ~50–100 linhas | Baixo (variáveis de ambiente documentadas) |
+| Wrapper do `memorix hook`: mesmo `DATA_DIR` por projeto e **redação de segredos no JSON do stdin** antes de repassar (regras no estilo gitleaks, PEM, URI com senha, `.env`) | ~150–300 linhas | Baixo (o formato do payload é do Claude/Codex, não do Memorix) |
+| Configuração própria de MCP e hooks para Claude Code e Codex, em vez do plugin (que usa o perfil `lite`) | configuração | Médio (conferir a cada upgrade) |
+| Backup: `sqlite3 .backup` + `integrity_check` + sha256, por projeto, agendado | ~50 linhas | Nenhuma |
+| Gate de upgrade: versão fixa; atualizar só depois de rodar t1–t12 contra a nova versão | já existe (os scripts) | — |
+| Nunca rodar `serve-http`, `dashboard` ou `background` | configuração | — |
+
+Total estimado: **1 a 2 semanas** para uma pessoa com ajuda de IA [INF], contra algo como 4 a 8 semanas para uma v1 própria [INF]. Manutenção: upgrades deliberados, cada um com o gate de testes.
+
+### O que o perímetro NÃO resolve
+
+1. **Autoridade:** continua não havendo distinção entre decisão humana e texto de IA. Mitigação barata: tratar **toda** memória como "não verificada". **Decisões humanas vivem fora do Memorix**, num arquivo versionado no git (por exemplo `DECISIONS.md`), alterado só por commits revisados pelo Rafael. Os agentes leem esse arquivo como fonte de autoridade e usam o Memorix só como contexto.
+2. **Prompt injection:** a memória continua chegando sem delimitadores. O perfil `micro` e o banco por projeto limitam o estrago ao próprio projeto, mas não impedem a manipulação dentro dele. Um proxy MCP que envolva as respostas em "dados não confiáveis" é possível (~300 linhas), mas isso já aumenta a manutenção.
+3. **Bugs de integridade** (merge que duplica, resolve com linha desatualizada, graph que perde edições concorrentes): só se resolvem com patch no Memorix.
+4. **Busca global legítima:** some, porque cada projeto tem o próprio banco. Era proibida na arquitetura original, então é aceitável.
+5. **ChatGPT:** continua exigindo HTTP + OAuth, que o perímetro não cobre. **Kimi:** MCP funciona; hooks precisam de um adaptador nosso de payload.
+6. **Upstream:** a segurança depende de o upstream não introduzir novos defaults perigosos. O gate de upgrade detecta regressões conhecidas, não novas.
+
+### Recomendação revisada
+
+**C+ agora, A′ só se for provado necessário.**
+
+- Usar o Memorix stock com o perímetro acima como Central Memory em produção pessoal. É menos trabalho e menos manutenção que A′, e cobre os furos críticos confirmados.
+- Autoridade humana fica no git, não na memória.
+- Reavaliar depois de 4 a 8 semanas de uso real. Construir A′ só se a falta de autoridade dentro da memória, a injeção dentro do projeto ou os bugs de integridade causarem problema concreto. Nesse caso, os dados migram via `memorix transfer export`.
+- Continua **não** recomendado: fork completo (B) e Memorix stock sem perímetro (C).
