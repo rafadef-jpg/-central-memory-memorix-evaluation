@@ -952,3 +952,169 @@ Total estimado: **1 a 2 semanas** para uma pessoa com ajuda de IA [INF], contra 
 - Autoridade humana fica no git, não na memória.
 - Reavaliar depois de 4 a 8 semanas de uso real. Construir A′ só se a falta de autoridade dentro da memória, a injeção dentro do projeto ou os bugs de integridade causarem problema concreto. Nesse caso, os dados migram via `memorix transfer export`.
 - Continua **não** recomendado: fork completo (B) e Memorix stock sem perímetro (C).
+
+---
+
+## Adendo 2: ataque ao perímetro C+ — eixos integridade e autoridade
+
+Premissa desta rodada: **adotado Memorix stock, versão pinada, dentro do perímetro C+** (perfil `micro`, `MEMORIX_DATA_DIR` por projeto, URL de LLM fixada, sem `serve-http`/`dashboard`/`background`). A pergunta não é mais "o Memorix é seguro", e sim "o perímetro aguenta". Não corrigi código, não fiz merge, não redesenhei. PoCs em `synthetic-tests/t12`–`t16`.
+
+### Resumo do que o perímetro NÃO contém
+
+| # | Eixo | Achado | Alcançável no uso pretendido? | Gravidade |
+|---|---|---|---|---|
+| A1 | Escape | RCE via `.env` + `.codegraph` do repo clonado | Sim, com repo não confiável | **Crítica** |
+| A2 | Autoridade | `longTerm` auto-qualificado entra no brief no `micro` | Sim, só MCP | **Alta** |
+| A3 | Autoridade | Commit forjado rotulado "L3 — evidence / ground truth" | Sim, se git memory ligado | **Alta** |
+| A4 | Autoridade | `type:'decision'` + título casando a tarefa sobe no ranking; ranking é cego a produtor | Sim, só MCP | Média-Alta |
+| A5 | Autoridade | Texto de hook (prompt/saída de comando) vira visível ao projeto | Sim, se hooks + code link | Média |
+| A6 | Integridade | Consolidação no startup apaga memória (hard delete, sem prévia) | Sim, ligado por padrão | **Alta** |
+| A7 | Integridade | Overwrite silencioso por regressão de `meta.next_id` | Condicional (restore/sync/tooling) | Média (perda) |
+| A8 | Integridade | "[UPDATED] merged into #N" insere duplicata quando o alvo não tem topicKey | Sim, com Formation | Média |
+| A9 | Integridade | Graph `replaceAll` perde edições concorrentes entre processos | Sim, 2+ agentes simultâneos | Média |
+| A10 | Integridade | `resolveObservations` grava linha de cache; no-op silencioso em modo lazy | Sim, corpus grande | Média |
+| A11 | Integridade | Downgrade de binário pinado contra DB de schema mais novo | Só se downgrade | Baixa-Média |
+| OK | Integridade | Crash no meio da escrita: SQLite íntegro, FTS consistente | — | Resiliente |
+| OK | Integridade | Import realoca id (sem colisão) | — | Resiliente |
+
+---
+
+### EIXO 1 — INTEGRIDADE / PERDA DE MEMÓRIA
+
+#### A6. Consolidação automática no startup apaga memória (hard delete) — [TESTE t8]
+- **Código:** `src/config/behavior.ts:27` (`autoCleanup:true` por padrão); `src/server.ts:5725` (`startProjectMaintenanceWorker(behaviorConfig.autoCleanup)`) e `:552-556` (enfileira `consolidation` no startup); `src/runtime/project-maintenance.ts:150-156` (sem LLM → `executeConsolidation(..., {threshold:0.55})`); `src/memory/consolidation.ts:326-342` (`idsToRemove` → `tx.remove(id)`); `src/store/sqlite-store.ts:204` + `:431-434` (`stmtDelete` = `DELETE FROM observations WHERE id=?`, sem tombstone); agrupamento `entityName::type` em `:161`, Jaccard, limiares `:24` (0,45), `:27/:172-174` (0,85 para gotcha/decision/trade-off/reasoning/problem-solution).
+- **Fluxo:** servidor sobe → worker de manutenção → job `consolidation` → sem LLM (o perímetro remove as chaves) → clusteriza por similaridade de texto → mantém o "primary", **apaga fisicamente** os demais, concatenando as narrativas no primary e descartando `topicKey/sessionId/commitHash/relatedCommits/relatedEntities/attachments/evidence/embeddings/revisão`.
+- **Pré-condições:** `autoCleanup` ligado (padrão); ≥2 observações no mesmo `entity::type` com similaridade ≥ limiar; tipos de baixo valor bastam 0,55.
+- **Impacto:** memória válida e distinta some a cada reinício, sem prévia, sem confirmação, sem tombstone. Confirmado no t8: 5 observações `how-it-works` viraram 3.
+- **Alcançável no nosso uso?** Sim. O perfil `micro` **não** desliga jobs de background; o perfil só filtra tools MCP. Com múltiplos agentes reiniciando o servidor com frequência, roda muitas vezes.
+- **Mitigação no Memorix:** respeita visibilidade (só `project`/elegível); tipos de alto valor exigem 0,85; `deduplication.ts` usa soft-resolve — mas **não é o caminho do startup**.
+- **Mitigação necessária:** `autoCleanup:false` no config (o perímetro já manda, mas é fácil esquecer e a consolidação é feature de destaque); num fork, trocar `tx.remove` por `setStatus('archived')` com tombstone e exigir preview humano.
+
+#### A7. Overwrite silencioso por regressão do contador `meta.next_id` — [TESTE t16, mecanismo]
+- **Código:** `src/store/sqlite-store.ts:154-199` (`INSERT ... ON CONFLICT(id) DO UPDATE SET <todas as colunas>`; `stmtUpdate = stmtInsert` em `:199` — insert e update são o mesmo SQL); alocação por contador, não por `MAX(id)`: `:286-293` (`meta.next_id`, default 1), `src/memory/observations.ts:640` (`id = Math.max(nextId, diskNextId)`), `:680` (`saveIdCounter(id+1)`). `MAX(id)` só é reconciliado no sync (`src/sync/store-port.ts:210`) e na migração de JSON (`sqlite-store.ts:337`), **nunca no caminho quente**.
+- **Fluxo:** se `meta.next_id` fica abaixo de um id vivo, o próximo store calcula um id que colide e o `ON CONFLICT DO UPDATE` **sobrescreve a linha inteira** — sem erro, sem tombstone.
+- **Pré-condições:** regressão do contador. Não acontece em operação single-process normal (o store mantém contador e linhas consistentes). Acontece com: restore parcial/antigo que recoloca `meta` atrás das linhas, ferramenta externa, ou futura ativação de sync/import que mexa em ids.
+- **Impacto:** perda silenciosa de memória durável. No t16, forçando `next_id` a 2, o store seguinte sobrescreveu "KEEP critical #2" por uma nota nova; o índice Orama lançou `isError`, mas a linha SQLite já tinha sido perdida (falha parcial entre os dois stores, sem rollback).
+- **Alcançável no nosso uso?** Baixa probabilidade no uso single-process puro; **média** porque o próprio perímetro recomenda backup/restore, onde um restore malcasado introduz exatamente isso.
+- **Mitigação no Memorix:** `BEGIN IMMEDIATE` evita corrida concorrente de id, mas não a regressão persistente; o sync port tem guarda de colisão.
+- **Mitigação necessária:** alocar id por `MAX(id)` (ou `AUTOINCREMENT`) no caminho quente; no restore, reconciliar o contador com `MAX(id)`.
+
+#### A8. "[UPDATED] merged into #N" insere duplicata — [CÓDIGO, confirmado por mapeamento]
+- **Código:** `src/server.ts:948-1014` (Formation) e `:1053-1073` (compact); chamam `storeObservation({... topicKey: targetObs.topicKey})` e retornam `"[UPDATED] ... merged into #N"`. O upsert em `storeObservation` depende de topicKey truthy (`observations.ts:570`, `:625`); se o alvo não tem topicKey, cai em `tx.insert` com id novo (`:640-681`).
+- **Impacto:** o "merge" vira **insert de duplicata**; o alvo não é tocado; o id reportado não é o id gravado. Não há perda de conteúdo, mas há inchaço e um "updated" falso.
+- **Alcançável?** Sim, com Formation ativa (padrão) e alvos sem topicKey (a maioria).
+- **Mitigação necessária:** no fork, resolver o alvo por id quando não há topicKey, ou não reportar "UPDATED".
+
+#### A9. Graph `replaceAll` perde edições concorrentes — [CÓDIGO]
+- **Código:** `src/memory/graph.ts:40-47` (`init()` carrega snapshot uma vez, guardado por `initialized`), toda mutação chama `save()` → `store.replaceAll` (`:60-63`); `src/store/graph-store.ts:319-331` (`DELETE ... WHERE projectId=?` de relations e entities, depois reinsere o snapshot). Sem checagem de geração (ao contrário das observações).
+- **Impacto:** com 2 processos (ex.: Claude e Codex no mesmo projeto), o último a salvar apaga o grafo do projeto e regrava do seu snapshot antigo — as entidades/relações do outro somem.
+- **Alcançável?** Sim, é o cenário multi-agente que vocês querem.
+- **Mitigação necessária:** no fork, escrita incremental do grafo com guarda de geração.
+
+#### A10. `resolveObservations` grava linha de cache / no-op em lazy — [CÓDIGO]
+- **Código:** `src/memory/observations.ts:1046-1124` itera o cache em memória, muta e persiste a linha inteira (`tx.update`), sem usar `setStatusIfCurrent`. Em modo lazy (`:694-696` zera o cache) nada é encontrado → vai tudo para `notFound` e a função é **no-op silencioso**.
+- **Impacto:** (a) resolver pode regravar corpo desatualizado por cima de atualização de outro processo; (b) em corpus grande, "resolvido" pode não resolver nada.
+- **Alcançável?** Sim, quando o corpus cresce e entra em lazy mode.
+
+#### A11. Downgrade de binário pinado contra DB de schema mais novo — [CÓDIGO/INF]
+- **Código:** `src/store/sqlite-db.ts:311` (`schema_migrations(id TEXT)`), `:1158-1172` (aplica por id, ignora ids desconhecidos), `:1259-1270` (`ALTER TABLE ADD COLUMN` em try/catch). Sem `PRAGMA user_version`, sem down-migration, sem guarda "schema mais novo que o binário".
+- **Impacto:** se um dia rodarem um binário pinado **mais antigo** sobre um DB escrito por versão mais nova: colunas extras são ignoradas na leitura (`SELECT *`), mas o INSERT lista colunas fixas — uma coluna nova `NOT NULL` sem default quebra escrita; uma coluna nova defaultada é escrita como null/default (downgrade semântico silencioso). Nada detecta nem avisa.
+- **Alcançável?** Só em downgrade. Como a estratégia é pinar, o risco aparece se alguém rodar uma versão antiga sobre dados novos (ex.: duas máquinas com versões diferentes no mesmo diretório sincronizado).
+- **Mitigação necessária:** adotar `user_version` e recusar abrir DB de schema mais novo.
+
+#### Resiliências confirmadas (não são furos)
+- **Crash no meio da escrita [TESTE t14]:** após SIGKILL, `integrity_check=ok`, observations == FTS; o WAL recuperou. Perde só escrita não confirmada.
+- **Import é seguro contra colisão de id [TESTE]:** `export-import.ts:188` realoca via contador (alpha id 1 → id 2 no destino). Mas o row importado mantém o `projectId` de origem → vira órfão invisível no destino (correção, não perda).
+- **FTS é transacional com a escrita** (triggers no mesmo statement): a linha e o índice não divergem de um insert. A fragilidade é a reconciliação só por contagem (`sqlite-fts.ts:85-89`): se o conteúdo mudar sem mudar a contagem (edição direta no SQL), o índice fica velho sem rebuild.
+- **Índice semântico (LanceDB) é best-effort** e pode divergir (embedding que nunca completa = miss silencioso; vetor de item apagado que fica), mas os chamadores revalidam contra o SQLite. No perímetro, embeddings ficam `off`, então isso não se aplica.
+
+---
+
+### EIXO 2 — CONTAMINAÇÃO DE AUTORIDADE
+
+**Raiz comum:** o payload do brief e da busca **não tem fronteira estrutural dado × instrução**, e todo ranking é **cego ao produtor**. Qualquer texto que chegue à memória herda a autoridade do enquadramento "fatos do projeto".
+
+#### B1. Memória recuperada chega ao agente sem delimitador de "dado" — [CÓDIGO]
+- **Código:** `src/server.ts:1692, 1705-1707` (`memorix_project_context` retorna `context.workset.prompt` cru); `src/knowledge/workset.ts:502,516,642,825` (texto Markdown sob títulos "Memorix Autopilot Brief", "Resume from prior work", "Reliable memory"); narrativas interpoladas direto nas linhas (`:667, :833, :741`). O campo `trust` existe só nos objetos internos, nunca é escrito na saída (`appendLine` `:347-364`).
+- **Impacto:** título/narrativa armazenados aparecem como prosa de "estado do projeto", sem marca estrutural nem prosa de "isto é dado, não instrução". A única moldura em prosa existe no caminho dos **hooks** (`handler.ts:423-440`), que não cobre a saída do `memorix_project_context` que o CLAUDE.md manda o agente chamar como primeiro passo.
+- **Alcançável?** Sim; é o canal normal de recuperação.
+
+#### B2. `longTerm` auto-qualificado entra no brief no `micro` — [TESTE t15]
+- **Código:** `src/server.ts:1225-1229` (`maybeAutoQualifyLongTermMemory({sourceDetail:'explicit'})`); `src/memory/long-term.ts:527` (qualifica se `source==='manual' || sourceDetail==='explicit'` — e `memorix_store` sempre força `sourceDetail:'explicit'`); `src/knowledge/workset.ts:624-631` (bloco "Durable memory" no brief). Schema diz "not automatically injected" (`server.ts:774`) e CLAUDE.md diz "never injected until an operator records a review" — ambos **contrariados**.
+- **Fluxo:** agente chama `memorix_store` com `longTerm:{kind:'semantic',scope:'project'}` → a durável é qualificada na hora → entra no bloco "Durable memory" do brief.
+- **Impacto:** um chamador `micro` injeta memória durável de alta persistência com narrativa à escolha, sem revisão de operador. Confirmado no t15: a durável "LTINJECT" apareceu no brief.
+- **Alcançável?** Sim, só MCP `micro`, sem git/hook.
+- **Mitigação necessária:** tratar `longTerm` do agente como candidato não injetado (cumprir o que o schema promete); exigir revisão no canal humano.
+
+#### B3. Commit forjado rotulado "evidência / ground truth" — [TESTE t13]
+- **Código:** `src/cli/commands/ingest-commit.ts:167-179` (store `source:'git'`, sem visibility → default `project`, `visibility.ts:15-24`); apresentação elevada: `server.ts:1451-1452` ("git returns only commit-derived ground truth memories"), `:2625` ("git evidence"), detalhe mostra "[PIN] Git Repository Evidence [L3 — evidence]" / "Repository-backed"; boost de ranking `git:2.0/1.8` (`src/search/intent-detector.ts:205-214`). Sem verificação de autor do commit.
+- **Impacto:** num repo clonado, o corpo do commit é 100% do atacante; após o ingest vira memória de projeto que o sistema **ranqueia mais alto** e **rotula como "ground truth/evidence"** ao agente. Confirmado no t13.
+- **Alcançável?** Sim, sempre que a memória de git estiver ligada (feature de destaque). Precisa do caminho CLI/git-hook, não de uma chamada MCP `micro` pura.
+- **Mitigação necessária:** rebaixar `git` a "não confiável" na apresentação; nunca rotular como evidence/ground truth sem verificação.
+
+#### B4. Ranking cego ao produtor — `type:'decision'` + título sobem — [CÓDIGO]
+- **Código:** `src/search/intent-detector.ts:165-200` (`INTENT_TYPE_BOOSTS`: `decision:3.0`, `why-it-exists:3.0`, `how-it-works:3.0`, `problem-solution:3.0`); brief: `src/codegraph/task-lens.ts:420-434` pontua `[title,type,path,symbol]` vs tokens da tarefa. `type` e `title` são entrada livre do `memorix_store` (`server.ts:748-750`). Nenhum termo considera `source`, `createdByAgentId` ou origem de visibilidade.
+- **Impacto:** um chamador grava `type:'decision'` com título casando a tarefa e fica no topo da busca "why" (3,0×) e do brief, independente de quem produziu.
+- **Alcançável?** Sim, só MCP `micro`.
+
+#### B5. Texto de hook vira visível ao projeto — [CÓDIGO]
+- **Código:** `src/hooks/handler.ts:285-286` (hook grava `personal`, ator `hook:<sha>`); `extractContent` concatena prompt/saída/tool-result; para `user_prompt` o filtro de significância é pulado (`:594-605`). Widening: `src/runtime/project-maintenance.ts:385` (`sourceDetail==='hook' ? {visibility:'project'}`), via `updateObservationAdmission` (`observations.ts:994-998`).
+- **Fluxo:** prompt do usuário com "Rafael decidiu X", ou saída de WebFetch/comando com instrução injetada, é gravado → o job de qualificação o promove a `project` → aparece no brief como "Reliable memory" normal.
+- **Pré-condições:** hooks instalados; o texto referenciar arquivo/símbolo que um scan de código vincule; scan `indexedAt >= createdAt`; `valueCategory` não ephemeral.
+- **Mitigação no Memorix:** exige um vínculo de código atual e scan fresco — limita, mas o atacante controla o prompt e (se edita o repo) o código referenciado.
+
+#### B6. Sem fronteira de confiança entre agentes no mesmo projeto — [CÓDIGO, esperado]
+- **Código:** `src/memory/visibility.ts:42-54` (visibility `project` → qualquer leitor do mesmo projeto lê). No `micro`, `teamFeaturesEnabled=false` (`server.ts:274`), então `currentAgentId` fica `undefined` (`:3854, :3958`) e toda escrita é forçada a `project` (`:805`). Dois agentes (claude, codex) no mesmo `MEMORIX_DATA_DIR` leem tudo um do outro sem gate.
+- **Impacto:** é o compartilhamento que vocês querem — mas não há camada que diga "B deve confiar no que A escreveu". Combinado com B1/B4, o que um agente (ou um agente manipulado) planta, o outro consome como fato.
+
+#### Não alcançável no `micro` (confirmado)
+- `memorix_feedback`/`memorix_evidence` são `lite+` (`tool-profile.ts:47-48`): a forja de "verificação humana" (t9) exige ao menos `lite`.
+- `memorix_promote`/`memorix_skills`/`rules_sync`/`workspace_sync` são `full` (`:77-82`): no `micro` **não há** caminho em runtime que escreva memória armazenada num arquivo de instrução (`CLAUDE.md`/`AGENTS.md`/`SKILL.md`). Os únicos escritores desses arquivos são os instaladores, em tempo de setup, com texto fixo do Memorix — não memória recuperada.
+- `memorix_store` **não** deixa o chamador forjar `source`/`sourceDetail`/`createdByAgentId`/`valueCategory` (não estão no schema; o servidor força — `server.ts:789, 1199-1201`).
+
+---
+
+### Inventário defensivo (o que o perímetro cobre e o que falta)
+
+| Vetor | Mitigado pelo perímetro? | O que ainda falta (config ou código) |
+|---|---|---|
+| Leitura/escrita cross-project, import forjado | Sim (DB por projeto + `micro` tira `transfer`) | — |
+| Exfiltração de chave via `.env` | Sim (URL de LLM fixada + env de sistema vence) | — |
+| **RCE via `.env`+`.codegraph` (A1)** | **Não** | Lançador por **allowlist** de env (remover todo `MEMORIX_*` não fixado, incl. `MEMORIX_CODEGRAPH_EXTERNAL_COMMAND`); neutralizar `memorix.toml/yml` do projeto; ou fork que ignore config de projeto não confiável |
+| **Consolidação destrutiva (A6)** | Parcial (só se setar `autoCleanup:false`) | Config obrigatória no lançador; fork: soft-delete + preview |
+| Overwrite por contador (A7) | Não | Reconciliar `MAX(id)` no restore; fork: id por `MAX(id)`/AUTOINCREMENT |
+| Graph multi-processo (A9) | Não | Fork: escrita incremental com guarda de geração; ou serializar 1 escritor |
+| Duplicata "UPDATED" (A8), resolve lazy (A10) | Não | Fork |
+| **Autoridade: brief sem fronteira dado×instrução (B1)** | **Não** | Proxy MCP que envolva a saída em bloco "dados não confiáveis" (~300 linhas); ou fork no renderizador |
+| **longTerm auto-inject (B2)** | **Não** | Config/fork: não qualificar `longTerm` do agente |
+| **git "ground truth" (B3)** | Não (se git memory ligado) | Não ligar memória de git em repo não confiável; fork: rebaixar rótulo |
+| Ranking cego a produtor (B4), hook widening (B5) | Não | Fork |
+| Decisão humana forjada por IA | Parcial | **Autoridade humana fora do Memorix**, em arquivo versionado no git revisado por você |
+| Backup/restore | Não (inexistente) | Script externo: `sqlite3 .backup` + `integrity_check` + sha256, por projeto |
+| Downgrade de schema (A11) | Não | Pinar a mesma versão em todas as máquinas; não compartilhar diretório entre versões |
+
+---
+
+### Conclusão atualizada de aptidão
+
+#### Cenário 1 — uso sem alterações (stock, fora do perímetro): **INADEQUADO**
+Bloqueadores objetivos: escrita/leitura cross-project (t1/t5/t7), exfiltração de chave (t10), RCE via `.env` (A1), consolidação destrutiva ligada por padrão (A6), sem modelo de autoridade (B1–B4). Já era a conclusão da rodada 1; mantém-se.
+
+#### Cenário 2 — uso com hardening (perímetro C+ **apenas** config/lançador, sem tocar no código): **INADEQUADO para dado sensível; aceitável só para projetos descartáveis**
+Bloqueadores que a config não resolve:
+- **A1 (RCE):** só fecha com lançador por **allowlist** de env **e** neutralização de `memorix.toml/yml` de projeto — e nem assim cobre um `memorix.yml` lido do próprio repo; é frágil fazer isso de fora do código.
+- **A6 (consolidação):** depende de `autoCleanup:false` ser setado e nunca reativado; a feature é de destaque, o esquecimento é provável.
+- **B1/B2/B4 (autoridade):** config não cria fronteira dado×instrução nem desliga o auto-qualify de `longTerm`. No `micro`, B2 é alcançável só por MCP.
+Ou seja: o perímetro C+ que propus na rodada anterior **não é suficiente** para dado sensível multi-projeto. A1 sozinho já derruba a premissa "stock pinado + perímetro".
+
+#### Cenário 3 — fork e adaptação: **viável, mas é o custo que a rodada 1 já estimava**
+Para ficar adequado é preciso mexer no código: allowlist de env e recusa de config de projeto não confiável (A1); soft-delete com preview (A6); id por `MAX(id)` + reconciliação no restore (A7); escrita incremental de grafo (A9); corrigir "UPDATED"/resolve (A8/A10); `user_version` (A11); fronteira estrutural dado×instrução no renderizador e ranking ciente de produtor (B1/B4); cumprir a promessa de `longTerm` não injetado (B2); rebaixar rótulo de git (B3). São 6+ pontos arquiteturais no núcleo quente — o mesmo veredito de insustentabilidade da seção 21 (upstream a cada ~2 dias nesses arquivos).
+
+#### Cenário 4 — adequado como está para o nosso caso: **não existe**
+
+### Veredito desta rodada
+O stress test **inverte a recomendação revisada do Adendo 1**. "Memorix stock pinado + perímetro C+" não sobrevive a um repositório não confiável (A1, RCE) nem entrega integridade (A6) ou autoridade (B1/B2) por configuração. As opções reais continuam sendo:
+- **Fork com hardening** (Cenário 3) — tecnicamente possível, caro de manter (seção 21);
+- **Central Memory próprio** na arquitetura simplificada (A′ da seção 25) — onde A1, A6, B1, B2 são decisões de projeto que já não existem.
+
+Se o Memorix for usado no curto prazo, que seja **só em projetos sem dado sensível, sem clonar repositório de terceiros, com `autoCleanup:false`, memória de git desligada e um lançador por allowlist de env** — e a autoridade humana vivendo fora do Memorix, num arquivo git revisado por você. Para o uso central multi-projeto pretendido, o perímetro-só não basta.
